@@ -1,0 +1,18 @@
+sample:
+  name: TLS Persistent Session Cache
+  description: |
+    Demonstrates TLS session resumption across reboots using NVS-backed
+    persistent session caching.
+common:
+  tags:
+    - net
+    - socket
+    - tls
+  depends_on: netif flash
+tests:
+  sample.net.sockets.tls_session_cache:
+    platform_allow:
+      - qemu_x86
+      - native_sim
+    extra_configs:
+      - CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT=y

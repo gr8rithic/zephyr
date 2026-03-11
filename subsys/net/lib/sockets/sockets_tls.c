@@ -52,6 +52,12 @@ LOG_MODULE_REGISTER(net_sock_tls, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #include "tls_internal.h"
 #include "../../ip/net_private.h"
 
+#if defined(CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT)
+#include <zephyr/drivers/flash.h>
+#include <zephyr/storage/flash_map.h>
+#include <zephyr/kvss/nvs.h>
+#endif
+
 #if defined(CONFIG_MBEDTLS_DEBUG)
 #include <zephyr_mbedtls_priv.h>
 #endif
@@ -310,6 +316,135 @@ static struct tls_session_cache client_cache[CONFIG_NET_SOCKETS_TLS_MAX_CLIENT_S
 static mbedtls_ssl_cache_context server_cache;
 #endif
 
+#if defined(CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT)
+
+#define TLS_NVS_PARTITION	storage_partition
+#define TLS_NVS_PARTITION_DEVICE	FIXED_PARTITION_DEVICE(TLS_NVS_PARTITION)
+#define TLS_NVS_PARTITION_OFFSET	FIXED_PARTITION_OFFSET(TLS_NVS_PARTITION)
+
+/* NVS IDs: each session slot uses two consecutive IDs:
+ * - even ID for peer address (struct net_sockaddr_storage)
+ * - odd ID for serialized session data
+ */
+#define TLS_NVS_SESSION_ADDR_ID(i)	(0x100 + (i) * 2)
+#define TLS_NVS_SESSION_DATA_ID(i)	(0x100 + (i) * 2 + 1)
+
+static struct nvs_fs tls_nvs_fs;
+static bool tls_nvs_ready;
+
+static int tls_nvs_init(void)
+{
+	struct flash_pages_info info;
+	int rc;
+
+	tls_nvs_fs.flash_device = TLS_NVS_PARTITION_DEVICE;
+	if (!device_is_ready(tls_nvs_fs.flash_device)) {
+		NET_ERR("TLS session NVS flash device not ready");
+		return -ENODEV;
+	}
+
+	tls_nvs_fs.offset = TLS_NVS_PARTITION_OFFSET;
+	rc = flash_get_page_info_by_offs(tls_nvs_fs.flash_device,
+					 tls_nvs_fs.offset, &info);
+	if (rc) {
+		NET_ERR("TLS session NVS flash page info err %d", rc);
+		return rc;
+	}
+
+	tls_nvs_fs.sector_size = info.size;
+	tls_nvs_fs.sector_count =
+		CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_NVS_SECTOR_COUNT;
+
+	rc = nvs_mount(&tls_nvs_fs);
+	if (rc) {
+		NET_ERR("TLS session NVS mount err %d", rc);
+		return rc;
+	}
+
+	tls_nvs_ready = true;
+	NET_DBG("TLS session NVS initialized");
+	return 0;
+}
+
+static void tls_session_cache_save_nvs(int idx)
+{
+	if (!tls_nvs_ready || client_cache[idx].session == NULL) {
+		return;
+	}
+
+	nvs_write(&tls_nvs_fs, TLS_NVS_SESSION_ADDR_ID(idx),
+		  &client_cache[idx].peer_addr,
+		  sizeof(client_cache[idx].peer_addr));
+
+	nvs_write(&tls_nvs_fs, TLS_NVS_SESSION_DATA_ID(idx),
+		  client_cache[idx].session,
+		  client_cache[idx].session_len);
+
+	NET_DBG("TLS session %d saved to NVS", idx);
+}
+
+static void tls_session_cache_load_nvs(void)
+{
+	ssize_t rc;
+
+	if (!tls_nvs_ready) {
+		return;
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(client_cache); i++) {
+		struct net_sockaddr_storage addr;
+		ssize_t data_len;
+
+		rc = nvs_read(&tls_nvs_fs, TLS_NVS_SESSION_ADDR_ID(i),
+			      &addr, sizeof(addr));
+		if (rc <= 0) {
+			continue;
+		}
+
+		/* Read session data length first */
+		data_len = nvs_read(&tls_nvs_fs, TLS_NVS_SESSION_DATA_ID(i),
+				    NULL, 0);
+		if (data_len <= 0) {
+			continue;
+		}
+
+		uint8_t *session_buf = mbedtls_calloc(1, data_len);
+
+		if (session_buf == NULL) {
+			NET_ERR("TLS session NVS alloc failed for slot %d", i);
+			continue;
+		}
+
+		rc = nvs_read(&tls_nvs_fs, TLS_NVS_SESSION_DATA_ID(i),
+			      session_buf, data_len);
+		if (rc != data_len) {
+			mbedtls_free(session_buf);
+			continue;
+		}
+
+		client_cache[i].session = session_buf;
+		client_cache[i].session_len = data_len;
+		client_cache[i].timestamp = k_uptime_get();
+		memcpy(&client_cache[i].peer_addr, &addr, sizeof(addr));
+
+		NET_DBG("TLS session %d restored from NVS", i);
+	}
+}
+
+static void tls_session_cache_clear_nvs(void)
+{
+	if (!tls_nvs_ready) {
+		return;
+	}
+
+	for (int i = 0; i < CONFIG_NET_SOCKETS_TLS_MAX_CLIENT_SESSION_COUNT; i++) {
+		nvs_delete(&tls_nvs_fs, TLS_NVS_SESSION_ADDR_ID(i));
+		nvs_delete(&tls_nvs_fs, TLS_NVS_SESSION_DATA_ID(i));
+	}
+}
+
+#endif /* CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT */
+
 /* A mutex for protecting TLS context allocation. */
 static struct k_mutex context_lock;
 
@@ -440,6 +575,12 @@ static int tls_init(void)
 
 #if defined(MBEDTLS_SSL_CACHE_C)
 	mbedtls_ssl_cache_init(&server_cache);
+#endif
+
+#if defined(CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT)
+	if (tls_nvs_init() == 0) {
+		tls_session_cache_load_nvs();
+	}
 #endif
 
 	return 0;
@@ -737,6 +878,10 @@ static int tls_session_save(const struct net_sockaddr *peer_addr,
 	entry->timestamp = k_uptime_get();
 	memcpy(&entry->peer_addr, peer_addr, sizeof(*peer_addr));
 
+#if defined(CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT)
+	tls_session_cache_save_nvs(entry - client_cache);
+#endif
+
 	return 0;
 }
 
@@ -842,6 +987,10 @@ exit:
 static void tls_session_purge(void)
 {
 	tls_session_cache_reset();
+
+#if defined(CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT)
+	tls_session_cache_clear_nvs();
+#endif
 
 #if defined(MBEDTLS_SSL_CACHE_C)
 	mbedtls_ssl_cache_free(&server_cache);

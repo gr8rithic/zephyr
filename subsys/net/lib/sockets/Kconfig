@@ -275,6 +275,26 @@ config NET_SOCKETS_TLS_MAX_CLIENT_SESSION_COUNT
 	  This variable specifies maximum number of stored TLS/DTLS sessions,
 	  used for TLS/DTLS session resumption.
 
+config NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT
+	bool "Persistent TLS session cache across reboots"
+	depends on NET_SOCKETS_SOCKOPT_TLS
+	depends on NVS
+	depends on FLASH_MAP
+	help
+	  Enable persistent storage of TLS/DTLS client sessions in
+	  non-volatile storage (NVS). When enabled, TLS sessions are
+	  saved to flash after a successful handshake and restored on
+	  boot, allowing session resumption across device reboots.
+	  Uses the "storage_partition" flash partition.
+
+config NET_SOCKETS_TLS_SESSION_CACHE_NVS_SECTOR_COUNT
+	int "NVS sector count for TLS session cache"
+	default 2
+	depends on NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT
+	help
+	  Number of NVS sectors to use for TLS session cache storage.
+	  Minimum is 2.
+
 config NET_SOCKETS_TLS_CERT_VERIFY_CALLBACK
 	bool "TLS certificate verification callback support"
 	depends on NET_SOCKETS_SOCKOPT_TLS

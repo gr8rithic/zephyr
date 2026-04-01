@@ -69,6 +69,31 @@ Note, that TLS support in the sample depends on non-posix, TLS socket
 functionality. Therefore, it is only possible to run TLS in this sample
 on Zephyr.
 
+Enabling TLS Session Cache
+==========================
+
+To enable persistent TLS session caching, use the
+``overlay-tls-session-cache.conf`` overlay on top of the TLS overlay:
+
+.. zephyr-app-commands::
+   :zephyr-app: samples/net/sockets/http_get
+   :board: <board_to_use>
+   :conf: "prj.conf overlay-tls.conf overlay-tls-session-cache.conf"
+   :goals: build
+   :compact:
+
+This overlay enables:
+
+- **TLS 1.3 and session tickets**: Most modern servers (e.g. Google) require
+  RFC 5077 session tickets or TLS 1.3 PSK-based resumption and do not support
+  TLS 1.2 session ID-based resumption. If your server supports session ID
+  resumption, ``CONFIG_MBEDTLS_SSL_PROTO_TLS1_3`` and
+  ``CONFIG_MBEDTLS_SSL_SESSION_TICKETS`` can be omitted.
+
+- **Persistent session cache**: Sessions are saved to using settings
+  subsystem after each successful handshake and restored on boot, allowing
+  session resumption across device reboots without a full handshake.
+
 Wi-Fi
 =====
 
